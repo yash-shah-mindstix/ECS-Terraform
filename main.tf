@@ -108,6 +108,36 @@ resource "aws_security_group" "ecs" {
   tags = local.common_tags
 }
 
+resource "aws_security_group" "ecs2" {
+  name   = "${var.project_name}-ecs2-sg"
+  vpc_id = var.vpc_id
+
+  # Allow traffic from ALB
+  ingress {
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  # Allow traffic only from Service A SG
+  ingress {
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ecs.id] # Only Service A
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = local.common_tags
+}
+
 ############################################
 # ALB (Ingress Equivalent)
 ############################################
@@ -117,42 +147,94 @@ resource "aws_lb" "demo" {
   load_balancer_type = "application"
   subnets            = var.public_subnet_ids
   security_groups    = [aws_security_group.alb.id]
-  tags               = local.common_tags
+
+  tags = local.common_tags
 }
 
-resource "aws_lb_target_group" "demo" {
-  name        = "${var.project_name}-tg"
+# Target Group for Service A
+resource "aws_lb_target_group" "service_a_tg" {
+  name        = "${var.project_name}-tg-a"
   port        = 80
   protocol    = "HTTP"
   vpc_id      = var.vpc_id
   target_type = "ip"
 
   health_check {
-    path = "/"
+    path                = "/"
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    matcher             = "200-399"
   }
 
   tags = local.common_tags
 }
 
+# Target Group for Service B
+resource "aws_lb_target_group" "service_b_tg" {
+  name        = "${var.project_name}-tg-b"
+  port        = 80
+  protocol    = "HTTP"
+  vpc_id      = var.vpc_id
+  target_type = "ip"
+
+  health_check {
+    path                = "/"
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    matcher             = "200-399"
+  }
+
+  tags = local.common_tags
+}
+
+# HTTP Listener
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.demo.arn
   port              = 80
   protocol          = "HTTP"
 
   default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.demo.arn
+    type = "fixed-response"
+    fixed_response {
+      content_type = "text/plain"
+      message_body = "Not Found"
+      status_code  = "404"
+    }
   }
 }
 
-############################################
-# CloudWatch Logs
-############################################
+# Listener Rule for Service A
+resource "aws_lb_listener_rule" "service_a_rule" {
+  listener_arn = aws_lb_listener.http.arn
+  priority     = 100
 
-resource "aws_cloudwatch_log_group" "ecs" {
-  name              = "/ecs/${var.project_name}"
-  retention_in_days = 7
-  tags              = local.common_tags
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.service_a_tg.arn
+  }
+
+  condition {
+    path_pattern {
+      values = ["/service-a/*"]
+    }
+  }
+}
+
+# Listener Rule for Service B
+resource "aws_lb_listener_rule" "service_b_rule" {
+  listener_arn = aws_lb_listener.http.arn
+  priority     = 200
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.service_b_tg.arn
+  }
+
+  condition {
+    path_pattern {
+      values = ["/service-b/*"]
+    }
+  }
 }
 
 ############################################
@@ -176,15 +258,6 @@ resource "aws_ecs_task_definition" "demo" {
       portMappings = [{
         containerPort = 80
       }]
-
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          awslogs-group         = aws_cloudwatch_log_group.ecs.name
-          awslogs-region        = var.region
-          awslogs-stream-prefix = "ecs"
-        }
-      }
     }
   ])
 
@@ -195,54 +268,84 @@ resource "aws_ecs_task_definition" "demo" {
 # ECS Service
 ############################################
 
-resource "aws_ecs_service" "demo" {
-  name            = "${var.project_name}-service"
+resource "aws_ecs_service" "serviceA" {
+  name            = "${var.project_name}-service-a"
   cluster         = aws_ecs_cluster.demo.id
   task_definition = aws_ecs_task_definition.demo.arn
-  desired_count   = 0
+  desired_count   = 1
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets          = var.public_subnet_ids
+    subnets          = var.pvt_subnet_ids
     security_groups  = [aws_security_group.ecs.id]
-    assign_public_ip = true
+    assign_public_ip = false
   }
 
   load_balancer {
-    target_group_arn = aws_lb_target_group.demo.arn
+    target_group_arn = aws_lb_target_group.service_a_tg.arn
     container_name   = "demo"
     container_port   = 80
   }
 
-  depends_on = [aws_lb_listener.http]
+  depends_on = [
+    aws_lb_listener_rule.service_a_rule
+  ]
+
+  tags = local.common_tags
+}
+
+resource "aws_ecs_service" "serviceB" {
+  name            = "${var.project_name}-service-b"
+  cluster         = aws_ecs_cluster.demo.id
+  task_definition = aws_ecs_task_definition.demo.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = var.pvt_subnet_ids
+    security_groups  = [aws_security_group.ecs2.id]
+    assign_public_ip = false
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.service_b_tg.arn
+    container_name   = "demo"
+    container_port   = 80
+  }
+
+  depends_on = [
+    aws_lb_listener_rule.service_b_rule
+  ]
 
   tags = local.common_tags
 }
 
 ############################################
-# Auto Scaling
+# Auto Scaling – Service A
 ############################################
 
-resource "aws_appautoscaling_target" "ecs" {
-  max_capacity       = 4
-  min_capacity       = 1
-  resource_id        = "service/${aws_ecs_cluster.demo.name}/${aws_ecs_service.demo.name}"
-  scalable_dimension = "ecs:service:DesiredCount"
+# 1) Define the scalable target
+resource "aws_appautoscaling_target" "serviceA_target" {
   service_namespace  = "ecs"
+  scalable_dimension = "ecs:service:DesiredCount"
+  resource_id        = "service/${aws_ecs_cluster.demo.name}/${aws_ecs_service.serviceA.name}"
+  min_capacity       = 1
+  max_capacity       = 4
 }
 
-resource "aws_appautoscaling_policy" "cpu" {
-  name               = "${var.project_name}-cpu-scaling"
+# 2) Define a target tracking scaling policy
+resource "aws_appautoscaling_policy" "serviceA_cpu_policy" {
+  name               = "${var.project_name}-cpu-scaling-A"
+  service_namespace  = aws_appautoscaling_target.serviceA_target.service_namespace
+  resource_id        = aws_appautoscaling_target.serviceA_target.resource_id
+  scalable_dimension = aws_appautoscaling_target.serviceA_target.scalable_dimension
   policy_type        = "TargetTrackingScaling"
-  resource_id        = aws_appautoscaling_target.ecs.resource_id
-  scalable_dimension = aws_appautoscaling_target.ecs.scalable_dimension
-  service_namespace  = aws_appautoscaling_target.ecs.service_namespace
 
   target_tracking_scaling_policy_configuration {
-    target_value = 5
-
     predefined_metric_specification {
       predefined_metric_type = "ECSServiceAverageCPUUtilization"
     }
+
+    target_value = 50.0
   }
 }
